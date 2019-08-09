@@ -20,8 +20,9 @@ LSPResult LSPLoop::processRequest(unique_ptr<core::GlobalState> gs, const LSPMes
 
 LSPResult LSPLoop::processRequests(unique_ptr<core::GlobalState> gs, vector<unique_ptr<LSPMessage>> messages) {
     LSPLoop::QueueState state{{}, false, false, 0};
+    atomic<int> epoch;
     for (auto &message : messages) {
-        enqueueRequest(logger, state, move(message));
+        enqueueRequest(logger, state, move(message), epoch);
     }
     ENFORCE(state.paused == false, "__PAUSE__ not supported in single-threaded mode.");
 
@@ -58,22 +59,22 @@ LSPResult LSPLoop::processRequestInternal(unique_ptr<core::GlobalState> gs, cons
         if (method == LSPMethod::TextDocumentDidChange) {
             prodCategoryCounterInc("lsp.messages.processed", "textDocument.didChange");
             return commitTypecheckRun(
-                handleSorbetWorkspaceEdit(move(gs), *get<unique_ptr<DidChangeTextDocumentParams>>(params)));
+                handleSorbetWorkspaceEdit(move(gs), msg.epoch, *get<unique_ptr<DidChangeTextDocumentParams>>(params)));
         }
         if (method == LSPMethod::TextDocumentDidOpen) {
             prodCategoryCounterInc("lsp.messages.processed", "textDocument.didOpen");
             return commitTypecheckRun(
-                handleSorbetWorkspaceEdit(move(gs), *get<unique_ptr<DidOpenTextDocumentParams>>(params)));
+                handleSorbetWorkspaceEdit(move(gs), msg.epoch, *get<unique_ptr<DidOpenTextDocumentParams>>(params)));
         }
         if (method == LSPMethod::TextDocumentDidClose) {
             prodCategoryCounterInc("lsp.messages.processed", "textDocument.didClose");
             return commitTypecheckRun(
-                handleSorbetWorkspaceEdit(move(gs), *get<unique_ptr<DidCloseTextDocumentParams>>(params)));
+                handleSorbetWorkspaceEdit(move(gs), msg.epoch, *get<unique_ptr<DidCloseTextDocumentParams>>(params)));
         }
         if (method == LSPMethod::SorbetWatchmanFileChange) {
             prodCategoryCounterInc("lsp.messages.processed", "sorbet/watchmanFileChange");
             return commitTypecheckRun(
-                handleSorbetWorkspaceEdit(move(gs), *get<unique_ptr<WatchmanQueryResponse>>(params)));
+                handleSorbetWorkspaceEdit(move(gs), msg.epoch, *get<unique_ptr<WatchmanQueryResponse>>(params)));
         }
         if (method == LSPMethod::SorbetWorkspaceEdit) {
             // Note: We increment `lsp.messages.processed` when the original requests were merged into this one.
@@ -89,13 +90,13 @@ LSPResult LSPLoop::processRequestInternal(unique_ptr<core::GlobalState> gs, cons
             prodCounterAdd("lsp.messages.merged", (counts->textDocumentDidChange + counts->textDocumentDidOpen +
                                                    counts->textDocumentDidClose + counts->sorbetWatchmanFileChange) -
                                                       1);
-            return commitTypecheckRun(handleSorbetWorkspaceEdits(move(gs), edits));
+            return commitTypecheckRun(handleSorbetWorkspaceEdits(move(gs), msg.epoch, edits));
         }
         if (method == LSPMethod::Initialized) {
             prodCategoryCounterInc("lsp.messages.processed", "initialized");
             Timer timeit(logger, "initial_index");
             reIndexFromFileSystem();
-            LSPResult result = pushDiagnostics(runSlowPath({}));
+            LSPResult result = commitTypecheckRun(runSlowPath({}));
             ENFORCE(result.gs);
             if (!disableFastPath) {
                 ShowOperation stateHashOp(*this, "GlobalStateHash", "Finishing initialization...");
@@ -217,7 +218,12 @@ LSPResult LSPLoop::processRequestInternal(unique_ptr<core::GlobalState> gs, cons
             return handleTextDocumentCompletion(move(gs), id, *params);
         } else if (method == LSPMethod::TextDocumentCodeAction) {
             auto &params = get<unique_ptr<CodeActionParams>>(rawParams);
-            return handleTextDocumentCodeAction(move(gs), id, *params);
+            // Code action performs a typechecking operation to retrieve the active errors for the given file, which
+            // mutates the file table. We should commit those updates.
+            auto [responseMsg, typecheckRun] = handleTextDocumentCodeAction(move(gs), id, *params);
+            auto lspResult = commitTypecheckRun(move(typecheckRun));
+            lspResult.responses.push_back(move(responseMsg));
+            return lspResult;
         } else if (method == LSPMethod::TextDocumentSignatureHelp) {
             auto &params = get<unique_ptr<TextDocumentPositionParams>>(rawParams);
             return handleTextSignatureHelp(move(gs), id, *params);

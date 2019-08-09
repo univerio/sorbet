@@ -231,8 +231,8 @@ void LSPLoop::sendCountersToStatsd(chrono::time_point<chrono::steady_clock> curr
     }
 }
 
-LSPResult LSPResult::make(unique_ptr<core::GlobalState> gs, unique_ptr<ResponseMessage> response) {
-    LSPResult rv{move(gs), {}};
+LSPResult LSPResult::make(unique_ptr<core::GlobalState> gs, unique_ptr<ResponseMessage> response, bool canceled) {
+    LSPResult rv{move(gs), {}, canceled};
     rv.responses.push_back(make_unique<LSPMessage>(move(response)));
     return rv;
 }

@@ -4,14 +4,15 @@
 using namespace std;
 
 namespace sorbet::realmain::lsp {
-LSPResult LSPLoop::handleTextDocumentCodeAction(unique_ptr<core::GlobalState> gs, const MessageId &id,
-                                                const CodeActionParams &params) const {
+pair<unique_ptr<LSPMessage>, LSPLoop::TypecheckRun>
+LSPLoop::handleTextDocumentCodeAction(unique_ptr<core::GlobalState> gs, const MessageId &id,
+                                      const CodeActionParams &params) const {
     auto response = make_unique<ResponseMessage>("2.0", id, LSPMethod::TextDocumentCodeAction);
 
     if (!opts.lspQuickFixEnabled) {
         response->error = make_unique<ResponseError>(
             (int)LSPErrorCodes::InvalidRequest, "The `Quick Fix` LSP feature is experimental and disabled by default.");
-        return LSPResult::make(move(gs), move(response));
+        return make_pair(make_unique<LSPMessage>(move(response)), TypecheckRun(move(gs)));
     }
 
     vector<unique_ptr<CodeAction>> result;
@@ -76,6 +77,6 @@ LSPResult LSPLoop::handleTextDocumentCodeAction(unique_ptr<core::GlobalState> gs
 
     response->result = move(result);
 
-    return LSPResult::make(move(run.gs), move(response));
+    return make_pair(make_unique<LSPMessage>(move(response)), move(run));
 }
 } // namespace sorbet::realmain::lsp
