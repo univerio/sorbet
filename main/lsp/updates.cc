@@ -216,7 +216,8 @@ void tryApplyDefLocSaver(const core::GlobalState &gs, vector<ast::ParsedFile> &i
     }
 }
 
-LSPLoop::TypecheckRun LSPLoop::runSlowPath(FileUpdates updates, std::unique_ptr<core::GlobalState> previousGlobalState) const {
+LSPLoop::TypecheckRun LSPLoop::runSlowPath(FileUpdates updates,
+                                           std::unique_ptr<core::GlobalState> previousGlobalState) const {
     ShowOperation slowPathOp(*this, "SlowPath", "Typechecking...");
     Timer timeit(logger, "slow_path");
     ENFORCE(initialGS->errorQueue->isEmpty());
@@ -355,7 +356,7 @@ LSPLoop::TypecheckRun LSPLoop::runTypechecking(unique_ptr<core::GlobalState> gs,
     }
 
     if (!takeFastPath) {
-        return runSlowPath(move(updates));
+        return runSlowPath(move(updates), move(gs));
     }
 
     Timer timeit(logger, "fast_path");
