@@ -408,7 +408,7 @@ int getEditCountAtFrontOfQueue(const std::deque<std::unique_ptr<LSPMessage>> &q)
     if (q.empty()) {
         return 0;
     }
-    const auto &msg = *q.back();
+    const auto &msg = *q.front();
     switch (msg.method()) {
         case LSPMethod::TextDocumentDidOpen:
         case LSPMethod::TextDocumentDidClose:
