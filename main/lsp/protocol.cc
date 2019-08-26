@@ -250,7 +250,7 @@ void cancelRequest(std::deque<std::unique_ptr<LSPMessage>> &pendingRequests, con
 
 unique_ptr<core::GlobalState> LSPLoop::runLSP() {
     // Naming convention: thread that executes this function is called coordinator thread
-    LSPLoop::QueueState guardedState{{}, false, false, 0};
+    LSPLoop::QueueState guardedState{{}, false, false, 0, {}};
     absl::Mutex mtx;
     absl::Notification initializedNotification;
     shared_ptr<atomic<int>> epoch = make_shared<atomic<int>>(0);
@@ -262,7 +262,7 @@ unique_ptr<core::GlobalState> LSPLoop::runLSP() {
             // The lambda below intentionally does not capture `this`.
             watchmanProcess = make_unique<watchman::WatchmanProcess>(
                 logger, opts.watchmanPath, opts.rawInputDirNames.at(0), vector<string>({"rb", "rbi"}),
-                [&guardedState, &mtx, logger = this->logger, &initializedNotification,
+                [this, &guardedState, &mtx, &initializedNotification,
                  &epoch](std::unique_ptr<WatchmanQueryResponse> response) {
                     auto notifMsg =
                         make_unique<NotificationMessage>("2.0", LSPMethod::SorbetWatchmanFileChange, move(response));
@@ -293,34 +293,33 @@ unique_ptr<core::GlobalState> LSPLoop::runLSP() {
         }
     }
 
-    auto readerThread =
-        runInAThread("lspReader", [&guardedState, &mtx, &epoch, logger = this->logger, inputFd = this->inputFd] {
-            // Thread that executes this lambda is called reader thread.
-            // This thread _intentionally_ does not capture `this`.
-            NotifyOnDestruction notify(mtx, guardedState.terminate);
-            string buffer;
-            try {
-                auto timeit = make_unique<Timer>(logger, "getNewRequest");
-                while (true) {
-                    auto msg = getNewRequest(logger, inputFd, buffer);
-                    {
-                        absl::MutexLock lck(&mtx); // guards guardedState.
-                        if (msg) {
-                            enqueueRequest(logger, guardedState, move(msg), *epoch, true);
-                            // Reset span now that we've found a request.
-                            timeit = make_unique<Timer>(logger, "getNewRequest");
-                        }
-                        // Check if it's time to exit.
-                        if (guardedState.terminate) {
-                            // Another thread exited.
-                            break;
-                        }
+    auto readerThread = runInAThread("lspReader", [this, &guardedState, &mtx, &epoch] {
+        // Thread that executes this lambda is called reader thread.
+        // This thread _intentionally_ does not capture `this`.
+        NotifyOnDestruction notify(mtx, guardedState.terminate);
+        string buffer;
+        try {
+            auto timeit = make_unique<Timer>(logger, "getNewRequest");
+            while (true) {
+                auto msg = getNewRequest(logger, inputFd, buffer);
+                {
+                    absl::MutexLock lck(&mtx); // guards guardedState.
+                    if (msg) {
+                        enqueueRequest(logger, guardedState, move(msg), *epoch, true);
+                        // Reset span now that we've found a request.
+                        timeit = make_unique<Timer>(logger, "getNewRequest");
+                    }
+                    // Check if it's time to exit.
+                    if (guardedState.terminate) {
+                        // Another thread exited.
+                        break;
                     }
                 }
-            } catch (FileReadException e) {
-                // Failed to read from input stream. Ignore. NotifyOnDestruction will take care of exiting cleanly.
             }
-        });
+        } catch (FileReadException e) {
+            // Failed to read from input stream. Ignore. NotifyOnDestruction will take care of exiting cleanly.
+        }
+    });
 
     mainThreadId = this_thread::get_id();
     unique_ptr<core::GlobalState> gs;
@@ -356,6 +355,10 @@ unique_ptr<core::GlobalState> LSPLoop::runLSP() {
                 // prior to typechecking and can immediately abort -- because increments only happen while holding the
                 // queue lock.
                 msg->epoch = epoch->load();
+                // Store the file updates that will apply during this message, if any. Used to determine if the file
+                // updates can be canceled.
+                guardedState.currentFileUpdate.clear();
+                preprocessSorbetWorkspaceEdit(*msg, guardedState.currentFileUpdate);
             }
             logger->error(fmt::format("Starting {}", convertLSPMethodToString(msg->method())));
             prodCounterInc("lsp.messages.received");
@@ -402,13 +405,10 @@ unique_ptr<core::GlobalState> LSPLoop::runLSP() {
     }
 }
 
-// Counts how many distinct edit events are at the front of queue.
-// Needed because a SorbetWorkspaceEdit may encapsulate multiple edits.
-int getEditCountAtFrontOfQueue(const std::deque<std::unique_ptr<LSPMessage>> &q) {
-    if (q.empty()) {
+int getEditCount(const LSPMessage &msg) {
+    if (!msg.isNotification()) {
         return 0;
     }
-    const auto &msg = *q.front();
     switch (msg.method()) {
         case LSPMethod::TextDocumentDidOpen:
         case LSPMethod::TextDocumentDidClose:
@@ -422,6 +422,16 @@ int getEditCountAtFrontOfQueue(const std::deque<std::unique_ptr<LSPMessage>> &q)
         default:
             return 0;
     }
+}
+
+// Counts how many distinct edit events are at the front of queue.
+// Needed because a SorbetWorkspaceEdit may encapsulate multiple edits.
+int getEditCountAtFrontOfQueue(const std::deque<std::unique_ptr<LSPMessage>> &q) {
+    if (q.empty()) {
+        return 0;
+    }
+    const auto &msg = *q.front();
+    return getEditCount(msg);
 }
 
 void LSPLoop::enqueueRequest(const shared_ptr<spd::logger> &logger, LSPLoop::QueueState &state,
@@ -463,10 +473,20 @@ void LSPLoop::enqueueRequest(const shared_ptr<spd::logger> &logger, LSPLoop::Que
         state.counters = getAndClearThreadCounters();
     }
 
-    // Increase epoch if we have a new edit at front of queue.
-    if (editsAtFrontOfQueue < getEditCountAtFrontOfQueue(state.pendingRequests)) {
-        logger->error("Increasing epoch");
-        epoch.fetch_add(1);
+    // Increase epoch if we have a new edit at front of queue and if, in combination with the existing edit, will
+    // take the fast path.
+    if (editsAtFrontOfQueue < getEditCountAtFrontOfQueue(state.pendingRequests) && !state.currentFileUpdate.empty()) {
+        // Grab mutex to prevent coordinator thread from updating file table while this thread reads file table.
+        absl::MutexLock locker(&commitMutex);
+        // Copy map.
+        auto combinedChanges = state.currentFileUpdate;
+        preprocessSorbetWorkspaceEdit(**state.pendingRequests.begin(), combinedChanges);
+        auto updates = getFileUpdates(combinedChanges);
+        auto hashes = computeStateHashes(updates.updatedFiles);
+        if (canTakeFastPath(updates, hashes)) {
+            logger->error("Increasing epoch");
+            epoch.fetch_add(1);
+        }
     }
 }
 

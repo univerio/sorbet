@@ -819,11 +819,11 @@ TEST_P(LSPTest, All) {
 
     // Fast path tests: Asserts that certain changes take the fast/slow path, and produce any expected diagnostics.
     {
-        // sourceFileUpdates is unordered (and we can't use an ordered map unless we make its contents `const`)
+        // sourceLSPFileUpdates is unordered (and we can't use an ordered map unless we make its contents `const`)
         // Sort by version.
         vector<int> sortedUpdates;
         const int baseVersion = 4;
-        for (auto &update : test.sourceFileUpdates) {
+        for (auto &update : test.sourceLSPFileUpdates) {
             sortedUpdates.push_back(update.first);
         }
         fast_sort(sortedUpdates);
@@ -831,7 +831,7 @@ TEST_P(LSPTest, All) {
         // Apply updates in order.
         for (auto version : sortedUpdates) {
             auto errorPrefix = fmt::format("[*.{}.rbupdate] ", version);
-            auto &updates = test.sourceFileUpdates[version];
+            auto &updates = test.sourceLSPFileUpdates[version];
             vector<unique_ptr<LSPMessage>> lspUpdates;
             UnorderedMap<std::string, std::shared_ptr<core::File>> updatesAndContents;
 
@@ -998,7 +998,7 @@ vector<Expectations> listDir(const char *name) {
                 auto pos = s.rfind('.', s.length() - 10);
                 if (pos != string::npos) {
                     int version = stoi(s.substr(pos + 1, s.length() - 9));
-                    current.sourceFileUpdates[version].emplace_back(absl::StrCat(s.substr(0, pos), ".rb"), s);
+                    current.sourceLSPFileUpdates[version].emplace_back(absl::StrCat(s.substr(0, pos), ".rb"), s);
                 } else {
                     cout << "Ignoring " << s << ": No version number provided (expected .[number].rbupdate).\n";
                 }

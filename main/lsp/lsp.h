@@ -51,8 +51,29 @@ struct LSPResult {
                           bool canceled = false);
 };
 
+/**
+ * Encapsulates a set of updates to LSP's file state.
+ */
+struct LSPFileUpdates {
+    // (If a cancelable update) The epoch that scheduled this file update.
+    std::optional<int> updateEpoch;
+    std::vector<std::shared_ptr<core::File>> updatedFiles;
+    std::vector<std::string> openedFiles;
+    std::vector<std::string> closedFiles;
+    // TODO: Move to TypecheckRun?
+    std::vector<ast::ParsedFile> updatedFileIndexes;
+    std::vector<std::pair<std::string, core::FileHash>> updatedFileHashes;
+};
+
 class LSPLoop {
     friend class LSPWrapper;
+
+    // Distilled form of an update to a single file.
+    struct SorbetWorkspaceFileUpdate {
+        std::string contents = "";
+        bool newlyOpened = false;
+        bool newlyClosed = false;
+    };
 
     /** Used to store the state of LSPLoop's internal request queue.  */
     struct QueueState {
@@ -63,19 +84,8 @@ class LSPLoop {
         int errorCode = 0;
         // Counters collected from worker threads.
         CounterState counters;
-    };
-
-    /**
-     * Encapsulates an update to LSP's file state.
-     */
-    struct FileUpdates {
-        // (If a cancelable update) The epoch that scheduled this file update.
-        std::optional<int> updateEpoch;
-        std::vector<std::shared_ptr<core::File>> updatedFiles;
-        std::vector<std::string> openedFiles;
-        std::vector<std::string> closedFiles;
-        std::vector<ast::ParsedFile> updatedFileIndexes;
-        std::vector<std::pair<std::string_view, core::FileHash>> updatedFileHashes;
+        // The file updates that the message processing thread is currently applying.
+        UnorderedMap<std::string, LSPLoop::SorbetWorkspaceFileUpdate> currentFileUpdate;
     };
 
     /**
@@ -162,6 +172,12 @@ class LSPLoop {
     std::chrono::time_point<std::chrono::steady_clock> lastMetricUpdateTime;
     /** ID of the main thread, which actually processes LSP requests and performs typechecking. */
     std::thread::id mainThreadId;
+    /**
+     * Mutex that must be held while:
+     * 1. The coordinator thread is updating the file table in initialGS.
+     * 2. Secondary threads are reading the file table.
+     */
+    absl::Mutex commitMutex;
 
     /* Send the given message to client */
     void sendMessage(const LSPMessage &msg) const;
@@ -188,7 +204,7 @@ class LSPLoop {
         // Responses to the active LSP query.
         std::vector<std::unique_ptr<core::lsp::QueryResponse>> responses;
         // The edit applied to `gs`.
-        LSPLoop::FileUpdates updates;
+        LSPFileUpdates updates;
         // Specifies if the typecheck run took the fast or slow path.
         bool tookFastPath;
         // Specifies if the typecheck run was canceled.
@@ -196,8 +212,8 @@ class LSPLoop {
 
         TypecheckRun(std::unique_ptr<core::GlobalState> gs, std::vector<std::unique_ptr<core::Error>> errors = {},
                      std::vector<core::FileRef> filesTypechecked = {},
-                     std::vector<std::unique_ptr<core::lsp::QueryResponse>> responses = {},
-                     LSPLoop::FileUpdates updates = {}, bool tookFastPath = true);
+                     std::vector<std::unique_ptr<core::lsp::QueryResponse>> responses = {}, LSPFileUpdates updates = {},
+                     bool tookFastPath = true);
 
         // Make a canceled TypecheckRun.
         static TypecheckRun makeCanceled(std::unique_ptr<core::GlobalState> gs);
@@ -210,12 +226,13 @@ class LSPLoop {
     };
 
     /** Conservatively rerun entire pipeline without caching any trees */
-    TypecheckRun runSlowPath(FileUpdates updates, std::unique_ptr<core::GlobalState> previousGlobalState = nullptr) const;
+    TypecheckRun runSlowPath(LSPFileUpdates updates,
+                             std::unique_ptr<core::GlobalState> previousGlobalState = nullptr) const;
     /** Returns `true` if the given changes can run on the fast path. */
-    bool canTakeFastPath(const FileUpdates &updates, const std::vector<core::FileHash> &hashes) const;
+    bool canTakeFastPath(const LSPFileUpdates &updates, const std::vector<core::FileHash> &hashes) const;
     /** Applies conservative heuristics to see if we can run incremental typechecking on the update. If not, it bails
      * out and takes slow path. */
-    TypecheckRun runTypechecking(std::unique_ptr<core::GlobalState> gs, FileUpdates updates) const;
+    TypecheckRun runTypechecking(std::unique_ptr<core::GlobalState> gs, LSPFileUpdates updates) const;
     /** Runs the provided query against the given files, and returns matches. */
     QueryRun runQuery(std::unique_ptr<core::GlobalState> gs, const core::lsp::Query &q,
                       const std::vector<core::FileRef> &filesForQuery) const;
@@ -273,18 +290,13 @@ class LSPLoop {
      * Merges changes to the same document + Watchman filesystem updates, and processes pause/ignore requests.
      * If `collectThreadCounters` is `true`, it also merges in thread-local counters into the QueueState counters.
      */
-    static void enqueueRequest(const std::shared_ptr<spd::logger> &logger, LSPLoop::QueueState &state,
-                               std::unique_ptr<LSPMessage> msg, std::atomic<int> &epoch,
-                               bool collectThreadCounters = false);
+    void enqueueRequest(const std::shared_ptr<spd::logger> &logger, LSPLoop::QueueState &state,
+                        std::unique_ptr<LSPMessage> msg, std::atomic<int> &epoch, bool collectThreadCounters = false);
 
     LSPResult processRequestInternal(std::unique_ptr<core::GlobalState> gs, const LSPMessage &msg);
 
-    // Distilled form of an update to a single file.
-    struct SorbetWorkspaceFileUpdate {
-        std::string contents = "";
-        bool newlyOpened = false;
-        bool newlyClosed = false;
-    };
+    void preprocessSorbetWorkspaceEdit(const LSPMessage &msg,
+                                       UnorderedMap<std::string, SorbetWorkspaceFileUpdate> &updates) const;
     void preprocessSorbetWorkspaceEdit(const DidChangeTextDocumentParams &changeParams,
                                        UnorderedMap<std::string, SorbetWorkspaceFileUpdate> &updates) const;
     void preprocessSorbetWorkspaceEdit(const DidOpenTextDocumentParams &openParams,
@@ -293,6 +305,9 @@ class LSPLoop {
                                        UnorderedMap<std::string, SorbetWorkspaceFileUpdate> &updates) const;
     void preprocessSorbetWorkspaceEdit(const WatchmanQueryResponse &queryResponse,
                                        UnorderedMap<std::string, SorbetWorkspaceFileUpdate> &updates) const;
+    void preprocessSorbetWorkspaceEdit(const std::vector<std::unique_ptr<SorbetWorkspaceEdit>> &edits,
+                                       UnorderedMap<std::string, SorbetWorkspaceFileUpdate> &updates) const;
+
     TypecheckRun handleSorbetWorkspaceEdit(std::unique_ptr<core::GlobalState> gs, int msgEpoch,
                                            const DidChangeTextDocumentParams &changeParams) const;
     TypecheckRun handleSorbetWorkspaceEdit(std::unique_ptr<core::GlobalState> gs, int msgEpoch,
@@ -307,6 +322,7 @@ class LSPLoop {
                                             UnorderedMap<std::string, SorbetWorkspaceFileUpdate> &updates) const;
     static std::string_view getFileContents(UnorderedMap<std::string, LSPLoop::SorbetWorkspaceFileUpdate> &updates,
                                             const core::GlobalState &initialGS, std::string_view path);
+    static LSPFileUpdates getFileUpdates(const UnorderedMap<std::string, LSPLoop::SorbetWorkspaceFileUpdate> &updates);
 
     /** Returns `true` if 5 minutes have elapsed since LSP last sent counters to statsd. */
     bool shouldSendCountersToStatsd(std::chrono::time_point<std::chrono::steady_clock> currentTime) const;

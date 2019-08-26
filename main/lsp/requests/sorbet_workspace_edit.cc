@@ -104,24 +104,90 @@ void LSPLoop::preprocessSorbetWorkspaceEdit(const WatchmanQueryResponse &queryRe
     }
 }
 
+void LSPLoop::preprocessSorbetWorkspaceEdit(const vector<unique_ptr<SorbetWorkspaceEdit>> &edits,
+                                            UnorderedMap<string, SorbetWorkspaceFileUpdate> &updates) const {
+    for (auto &edit : edits) {
+        switch (edit->type) {
+            case SorbetWorkspaceEditType::EditorOpen: {
+                preprocessSorbetWorkspaceEdit(*get<unique_ptr<DidOpenTextDocumentParams>>(edit->contents), updates);
+                break;
+            }
+            case SorbetWorkspaceEditType::EditorChange: {
+                preprocessSorbetWorkspaceEdit(*get<unique_ptr<DidChangeTextDocumentParams>>(edit->contents), updates);
+                break;
+            }
+            case SorbetWorkspaceEditType::EditorClose: {
+                preprocessSorbetWorkspaceEdit(*get<unique_ptr<DidCloseTextDocumentParams>>(edit->contents), updates);
+                break;
+            }
+            case SorbetWorkspaceEditType::FileSystem: {
+                preprocessSorbetWorkspaceEdit(*get<unique_ptr<WatchmanQueryResponse>>(edit->contents), updates);
+                break;
+            }
+        }
+    }
+}
+
+void LSPLoop::preprocessSorbetWorkspaceEdit(const LSPMessage &msg,
+                                            UnorderedMap<string, LSPLoop::SorbetWorkspaceFileUpdate> &updates) const {
+    if (!msg.isNotification()) {
+        return;
+    }
+    const auto &rawParams = msg.asNotification().params;
+    switch (msg.method()) {
+        case LSPMethod::TextDocumentDidOpen: {
+            const auto &openParams = get<unique_ptr<DidOpenTextDocumentParams>>(rawParams);
+            preprocessSorbetWorkspaceEdit(*openParams, updates);
+            break;
+        }
+        case LSPMethod::TextDocumentDidClose: {
+            const auto &closeParams = get<unique_ptr<DidCloseTextDocumentParams>>(rawParams);
+            preprocessSorbetWorkspaceEdit(*closeParams, updates);
+            break;
+        }
+        case LSPMethod::TextDocumentDidChange: {
+            const auto &didChangeParams = get<unique_ptr<DidChangeTextDocumentParams>>(rawParams);
+            preprocessSorbetWorkspaceEdit(*didChangeParams, updates);
+            break;
+        }
+        case LSPMethod::SorbetWatchmanFileChange: {
+            const auto &watchmanParams = get<unique_ptr<WatchmanQueryResponse>>(rawParams);
+            preprocessSorbetWorkspaceEdit(*watchmanParams, updates);
+            break;
+        }
+        case LSPMethod::SorbetWorkspaceEdit: {
+            const auto &editParams = get<unique_ptr<SorbetWorkspaceEditParams>>(rawParams);
+            preprocessSorbetWorkspaceEdit(editParams->changes, updates);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+LSPFileUpdates LSPLoop::getFileUpdates(const UnorderedMap<string, LSPLoop::SorbetWorkspaceFileUpdate> &updates) {
+    LSPFileUpdates fileUpdates;
+    fileUpdates.updatedFiles.reserve(updates.size());
+    for (auto &update : updates) {
+        auto file =
+            make_shared<core::File>(string(update.first), string(update.second.contents), core::File::Type::Normal);
+        if (update.second.newlyClosed) {
+            fileUpdates.closedFiles.push_back(string(file->path()));
+        }
+        if (update.second.newlyOpened) {
+            fileUpdates.openedFiles.push_back(string(file->path()));
+        }
+        fileUpdates.updatedFiles.push_back(move(file));
+    }
+    return fileUpdates;
+}
+
 LSPLoop::TypecheckRun
 LSPLoop::commitSorbetWorkspaceEdits(unique_ptr<core::GlobalState> gs, int msgEpoch,
                                     UnorderedMap<string, LSPLoop::SorbetWorkspaceFileUpdate> &updates) const {
     if (!updates.empty()) {
-        FileUpdates fileUpdates;
+        LSPFileUpdates fileUpdates = getFileUpdates(updates);
         fileUpdates.updateEpoch = msgEpoch;
-        fileUpdates.updatedFiles.reserve(updates.size());
-        for (auto &update : updates) {
-            auto file =
-                make_shared<core::File>(string(update.first), move(update.second.contents), core::File::Type::Normal);
-            if (update.second.newlyClosed) {
-                fileUpdates.closedFiles.push_back(string(file->path()));
-            }
-            if (update.second.newlyOpened) {
-                fileUpdates.openedFiles.push_back(string(file->path()));
-            }
-            fileUpdates.updatedFiles.push_back(move(file));
-        }
         return runTypechecking(move(gs), move(fileUpdates));
     } else {
         return TypecheckRun(move(gs));
@@ -160,26 +226,7 @@ LSPLoop::TypecheckRun LSPLoop::handleSorbetWorkspaceEdits(unique_ptr<core::Globa
                                                           vector<unique_ptr<SorbetWorkspaceEdit>> &edits) const {
     // path => new file contents
     UnorderedMap<string, LSPLoop::SorbetWorkspaceFileUpdate> updates;
-    for (auto &edit : edits) {
-        switch (edit->type) {
-            case SorbetWorkspaceEditType::EditorOpen: {
-                preprocessSorbetWorkspaceEdit(*get<unique_ptr<DidOpenTextDocumentParams>>(edit->contents), updates);
-                break;
-            }
-            case SorbetWorkspaceEditType::EditorChange: {
-                preprocessSorbetWorkspaceEdit(*get<unique_ptr<DidChangeTextDocumentParams>>(edit->contents), updates);
-                break;
-            }
-            case SorbetWorkspaceEditType::EditorClose: {
-                preprocessSorbetWorkspaceEdit(*get<unique_ptr<DidCloseTextDocumentParams>>(edit->contents), updates);
-                break;
-            }
-            case SorbetWorkspaceEditType::FileSystem: {
-                preprocessSorbetWorkspaceEdit(*get<unique_ptr<WatchmanQueryResponse>>(edit->contents), updates);
-                break;
-            }
-        }
-    }
+    preprocessSorbetWorkspaceEdit(edits, updates);
     return commitSorbetWorkspaceEdits(move(gs), msgEpoch, updates);
 }
 

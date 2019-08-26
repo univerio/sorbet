@@ -42,8 +42,8 @@ LSPLoop::ShowOperation::~ShowOperation() {
 
 LSPLoop::TypecheckRun::TypecheckRun(unique_ptr<core::GlobalState> gs, vector<unique_ptr<core::Error>> errors,
                                     vector<core::FileRef> filesTypechecked,
-                                    vector<unique_ptr<core::lsp::QueryResponse>> responses,
-                                    LSPLoop::FileUpdates updates, bool tookFastPath)
+                                    vector<unique_ptr<core::lsp::QueryResponse>> responses, LSPFileUpdates updates,
+                                    bool tookFastPath)
     : gs(move(gs)), errors(move(errors)), filesTypechecked(move(filesTypechecked)), responses(move(responses)),
       updates(move(updates)), tookFastPath(tookFastPath) {}
 
@@ -73,6 +73,8 @@ LSPResult LSPLoop::commitTypecheckRun(TypecheckRun run) {
     }
 
     Timer timeit(logger, "commitTypecheckRun");
+    // Prevent secondary threads from reading file table while we update file table.
+    absl::MutexLock locker(&commitMutex);
     auto &updates = run.updates;
     // Update editor state.
     for (auto closedFile : updates.closedFiles) {
@@ -216,7 +218,7 @@ void tryApplyDefLocSaver(const core::GlobalState &gs, vector<ast::ParsedFile> &i
     }
 }
 
-LSPLoop::TypecheckRun LSPLoop::runSlowPath(FileUpdates updates,
+LSPLoop::TypecheckRun LSPLoop::runSlowPath(LSPFileUpdates updates,
                                            std::unique_ptr<core::GlobalState> previousGlobalState) const {
     ShowOperation slowPathOp(*this, "SlowPath", "Typechecking...");
     Timer timeit(logger, "slow_path");
@@ -285,7 +287,7 @@ LSPLoop::TypecheckRun LSPLoop::runSlowPath(FileUpdates updates,
     return TypecheckRun(move(finalGS), move(out.first), move(affectedFiles), move(out.second), move(updates), false);
 }
 
-bool LSPLoop::canTakeFastPath(const FileUpdates &updates, const vector<core::FileHash> &hashes) const {
+bool LSPLoop::canTakeFastPath(const LSPFileUpdates &updates, const vector<core::FileHash> &hashes) const {
     auto &changedFiles = updates.updatedFiles;
     logger->error("Trying to see if fast path is available after {} file changes", changedFiles.size());
     if (disableFastPath) {
@@ -316,7 +318,7 @@ bool LSPLoop::canTakeFastPath(const FileUpdates &updates, const vector<core::Fil
     return true;
 }
 
-LSPLoop::TypecheckRun LSPLoop::runTypechecking(unique_ptr<core::GlobalState> gs, FileUpdates updates) const {
+LSPLoop::TypecheckRun LSPLoop::runTypechecking(unique_ptr<core::GlobalState> gs, LSPFileUpdates updates) const {
     // Fast path isn't cancelable, so GlobalState should not have an expected epoch.
     ENFORCE(!gs->expectedLspEpoch.has_value());
     // We assume gs is a copy of initialGS, which has had the inferencer & resolver run.
@@ -350,7 +352,7 @@ LSPLoop::TypecheckRun LSPLoop::runTypechecking(unique_ptr<core::GlobalState> gs,
                 subset.emplace_back(fref);
             }
             // Note: We may not have an id yet for this file if it is brand new, so we store hashes with their paths.
-            updates.updatedFileHashes.push_back(make_pair(f->path(), hashes[i]));
+            updates.updatedFileHashes.push_back(make_pair(string(f->path()), hashes[i]));
         }
         core::NameHash::sortAndDedupe(changedHashes);
     }
