@@ -236,8 +236,7 @@ unique_ptr<core::GlobalState> LSPLoop::runLSP() {
     {
         // Ensure Watchman thread gets unstuck when thread exits.
         NotifyNotificationOnDestruction notify(initializedNotification);
-        // Notify other threads post-termination.
-        NotifyOnDestruction notifyIncoming(incomingMtx, incomingQueue.terminate);
+        bool exitProcessed = false;
         while (true) {
             unique_ptr<LSPMessage> msg;
             bool hasMoreMessages;
@@ -255,12 +254,13 @@ unique_ptr<core::GlobalState> LSPLoop::runLSP() {
                     if (processingQueue.errorCode != 0) {
                         // Abnormal termination.
                         throw options::EarlyReturnWithCode(processingQueue.errorCode);
-                    } else if (processingQueue.pendingRequests.empty()) {
-                        // Normal termination. Wait until all pending requests finish.
+                    } else if (exitProcessed || processingQueue.pendingRequests.empty()) {
+                        // Normal termination. Wait until all pending requests finish or we process an exit.
                         break;
                     }
                 }
                 msg = move(processingQueue.pendingRequests.front());
+                exitProcessed = msg->isNotification() && msg->method() == LSPMethod::Exit;
                 processingQueue.pendingRequests.pop_front();
                 hasMoreMessages = !processingQueue.pendingRequests.empty();
             }
