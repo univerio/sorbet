@@ -208,11 +208,12 @@ unique_ptr<core::GlobalState> LSPLoop::runLSP() {
                 {
                     absl::MutexLock lck(&incomingMtx);
                     incomingMtx.Await(absl::Condition(
-                        +[](LSPLoop::QueueState *guardedState) -> bool {
-                            return guardedState->terminate || !guardedState->pendingRequests.empty();
+                        +[](LSPLoop::QueueState *incomingQueue) -> bool {
+                            return incomingQueue->terminate || !incomingQueue->pendingRequests.empty();
                         },
                         &incomingQueue));
-                    if (incomingQueue.terminate) {
+                    // Only terminate once incoming queue is drained.
+                    if (incomingQueue.terminate && incomingQueue.pendingRequests.empty()) {
                         return;
                     }
                     msg = move(incomingQueue.pendingRequests.front());
@@ -244,9 +245,9 @@ unique_ptr<core::GlobalState> LSPLoop::runLSP() {
                 absl::MutexLock lck(&processingMtx);
                 Timer timeit(logger, "idle");
                 processingMtx.Await(absl::Condition(
-                    +[](LSPLoop::QueueState *guardedState) -> bool {
-                        return guardedState->terminate ||
-                               (!guardedState->paused && !guardedState->pendingRequests.empty());
+                    +[](LSPLoop::QueueState *processingQueue) -> bool {
+                        return processingQueue->terminate ||
+                               (!processingQueue->paused && !processingQueue->pendingRequests.empty());
                     },
                     &processingQueue));
                 ENFORCE(!processingQueue.paused);
