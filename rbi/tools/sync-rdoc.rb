@@ -1,6 +1,13 @@
 #!/usr/bin/env ruby
 require 'rdoc'
 
+# TODO: call-seq
+# TODO: new => initialize
+# TODO: aliases
+# TODO: `` ''
+# TODO: use commonmark renderer to inspect output
+# TODO: why isn't Float referenced
+
 class RBIFile
   attr_reader :path
 
