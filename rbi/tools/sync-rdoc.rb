@@ -339,11 +339,31 @@ class SyncRDoc
     find_module(namespace)&.constants_hash&.[](name)
   end
 
-  private def render_comment(doc, indentation)
-    context = doc.is_a?(RDoc::Context) ? doc : doc.parent
+  private def render_comment(code_obj, indentation)
+    context = code_obj.is_a?(RDoc::Context) ? code_obj : code_obj.parent
+
     formatter = ToMarkdownRef.new(options, "https://docs.ruby-lang.org/en/2.6.0/", context.path, context)
     formatter.width -= indentation.gsub("\t", '  ').length # account for indentation (assuming tabstop is 2)
-    doc.comment.accept(formatter)
+    code_obj.comment.accept(formatter)
+
+    # augment comment with some more information
+    if code_obj.is_a?(RDoc::MethodAttr)
+      unless code_obj.aliases.empty?
+        formatter.res << "\n"
+        aliases = code_obj.aliases.map do |a|
+          a.parent = context unless a.parent
+          "[`#{a.name}`](#{context.aref_to(a.path)})"
+        end.join(", ")
+        formatter.wrap("Also aliased as: #{aliases}")
+      end
+
+      alias_for = code_obj.is_alias_for
+      if alias_for
+        formatter.res << "\n"
+        formatter.wrap("Alias for: [`#{alias_for.name}`](#{context.aref_to(alias_for.path)})")
+      end
+    end
+
     formatter.res.join.lines
       .reverse_each
       .drop_while {|line| line.strip.empty?} # remove trailing blank lines
@@ -356,7 +376,7 @@ class SyncRDoc
     DocParser.new(file).each_doc do |path, def_node, doc_range, indentation|
       next if path =~ /\A(?:Sorbet|T)(?:\z|::|\.|\#)/
       namespace, separator, name = path.rpartition(/::|\.|\#/)
-      doc = case separator
+      code_obj = case separator
       when ""
         # toplevel constants could be documented as a class or constant, so try both (e.g. ENV)
         find_module(path) || find_constant("Object", name)
@@ -371,8 +391,9 @@ class SyncRDoc
         raise "impossible"
       end
 
-      if doc
-        to_replace.push([doc_range, render_comment(doc, indentation)])
+      rendered_lines = code_obj && render_comment(code_obj, indentation)
+      if rendered_lines && !rendered_lines.empty?
+        to_replace.push([doc_range, rendered_lines])
       elsif doc_range.size > 0
         Warning.warn("#{file.path}:#{def_node.first_lineno}:#{def_node.first_column}: #{path} has existing doc but can't find it with ri; not clobbering\n")
       end
