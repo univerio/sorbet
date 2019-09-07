@@ -1,4 +1,5 @@
 #!/usr/bin/env ruby
+require 'tmpdir'
 require 'rdoc'
 
 # TODO: call-seq
@@ -291,16 +292,23 @@ class SyncRDoc
   end
 
   private def store
-    return @store if defined?(@store)
-    @store = driver.stores.find {|s| s.source == 'ruby'}
-    rdoc.store = @store
-    @store
+    rdoc.store
   end
 
   private def options
     @options ||= begin
       opts = RDoc::Options.new
-      opts.parse(['--all'])
+      opts.parse([
+        '--root', @ruby_path,
+        '--encoding', 'UTF-8',
+        '--all',
+        '--op', Dir.tmpdir,
+        '--page-dir', File.join(@ruby_path, "doc"),
+        '--dry-run',
+        '--no-force-update',
+        '--no-coverage-report',
+        @ruby_path,
+      ])
       opts.setup_generator("darkfish")
       opts
     end
@@ -309,8 +317,7 @@ class SyncRDoc
   private def rdoc
     return @rdoc if defined?(@rdoc)
     @rdoc = RDoc::RDoc.new
-    @rdoc.options = options
-    @rdoc.generator = options.generator.new(store, options)
+    @rdoc.document(options)
     @rdoc
   end
 
@@ -320,7 +327,7 @@ class SyncRDoc
 
   private def find_module(name)
     begin
-      store.load_class(apply_renames(name))
+      store.find_class_or_module(apply_renames(name))
     rescue RDoc::Store::Error
       nil
     end
@@ -328,7 +335,8 @@ class SyncRDoc
 
   private def find_class_method(namespace, name)
     begin
-      store.load_method(apply_renames(namespace), "::#{name}")
+      # store.load_method(apply_renames(namespace), "::#{name}")
+      find_module(namespace)&.methods_hash&.[]("::#{name}")
     rescue RDoc::Store::Error
       nil
     end
@@ -336,7 +344,8 @@ class SyncRDoc
 
   private def find_instance_method(namespace, name)
     begin
-      store.load_method(apply_renames(namespace), "\##{name}")
+      # store.load_method(apply_renames(namespace), "\##{name}")
+      find_module(namespace)&.methods_hash&.[]("\##{name}")
     rescue RDoc::Store::Error
       nil
     end
@@ -351,7 +360,12 @@ class SyncRDoc
 
     formatter = ToMarkdownRef.new(options, "https://docs.ruby-lang.org/en/2.6.0/", context.path, context)
     formatter.width -= indentation.gsub("\t", '  ').length # account for indentation (assuming tabstop is 2)
-    code_obj.comment.accept(formatter)
+    comment = if code_obj.is_a?(RDoc::ClassModule)
+      code_obj.comment_location = code_obj.parse(code_obj.comment_location)
+    else
+      code_obj.comment = code_obj.parse(code_obj.comment)
+    end
+    comment.accept(formatter)
 
     # augment comment with some more information
     if code_obj.is_a?(RDoc::MethodAttr)
@@ -417,13 +431,12 @@ class SyncRDoc
   end
 
   def run!(argv)
-    store.load_all # ensure cross-referencing can find everything
-
     if argv.empty?
-      puts "Usage: #{$0} <rbi_path>..."
+      puts "Usage: #{$0} <ruby_path> <rbi_path>..."
       return 1
     end
 
+    @ruby_path = argv.shift
     argv.each do |dir|
       Dir.glob(File.join('**', '*.rbi'), base: dir) do |path|
         process_file!(RBIFile.new(File.join(dir, path)))
