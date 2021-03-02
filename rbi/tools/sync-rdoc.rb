@@ -185,8 +185,14 @@ class DocParser
       namespace = namespace.empty? ? "Object" : namespace
       yield "#{namespace}.#{name}", node, scope_stack.consume! || node
 
-    when :FCALL, # extend Foo
-         :VCALL # private
+    when :FCALL # extend Foo
+      name, args = node.children
+      if name == :module_function
+        defn, = args.children
+        walk_scope(defn, &blk) if defn.type == :DEFN
+      end
+      assert_clean!
+    when :VCALL # private
       assert_clean!
     else
       unexpected!(node)
