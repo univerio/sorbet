@@ -43,8 +43,13 @@ class ScopeStack
     attr_reader :name
     attr_accessor :last_sig
 
-    def initialize(name)
+    def initialize(name, singleton_class: false)
       @name = name
+      @singleton_class = singleton_class
+    end
+
+    def singleton_class?
+      @singleton_class
     end
   end
 
@@ -57,6 +62,13 @@ class ScopeStack
     stack.concat(states)
     yield
     stack.pop(states.length)
+  end
+
+  def with_singleton_class(&blk)
+    raise 'already in singleton class' if stack.last.singleton_class?
+    stack << DeclState.new(nil, singleton_class: true)
+    yield
+    stack.pop
   end
 
   def last_sig
@@ -79,6 +91,10 @@ class ScopeStack
     consumed = last_sig
     self.last_sig = nil
     consumed
+  end
+
+  def in_singleton_class?
+    stack.last.singleton_class?
   end
 end
 
@@ -137,7 +153,7 @@ class DocParser
     error!(scope_stack.last_sig, "unconsumed sig") unless scope_stack.last_sig.nil?
   end
 
-  private def walk_scope(node, singleton_class: false, &blk)
+  private def walk_scope(node, &blk)
     case node.type
     when :MODULE, :CLASS
       path, *, scope = node.children
@@ -153,16 +169,18 @@ class DocParser
       # type_member/type_template with the name Elem
       inst, scope = node.children
       error!(node, 'class << on something other than self') if inst.type != :SELF
-      if singleton_class
+      if scope_stack.in_singleton_class?
         error!(node, 'singleton class of a singleton class')
       else
-        walk_scope(scope, singleton_class: true, &blk)
+        scope_stack.with_singleton_class do
+          walk_scope(scope, &blk)
+        end
       end
     when :SCOPE, :BLOCK, :BEGIN
       assert_clean!
       node.children
         .select {|child| child.is_a?(RubyVM::AbstractSyntaxTree::Node)}
-        .each {|child| walk_scope(child, singleton_class: singleton_class, &blk)}
+        .each {|child| walk_scope(child, &blk)}
     when :CDECL
       names = if node.children.length == 2
         name, _rhs = node.children
@@ -183,7 +201,7 @@ class DocParser
       name, _scope = node.children
       namespace = scope_stack.current_namespace
       namespace = namespace.empty? ? "Object" : namespace
-      if singleton_class
+      if scope_stack.in_singleton_class?
         yield "#{namespace}.#{name}", node, scope_stack.consume! || node
       else
         yield "#{namespace}\##{name}", node, scope_stack.consume! || node
@@ -193,7 +211,7 @@ class DocParser
       error!(node, "expected self") unless receiver.type == :SELF
       namespace = scope_stack.current_namespace
       namespace = namespace.empty? ? "Object" : namespace
-      if singleton_class
+      if scope_stack.in_singleton_class?
         error!(node, 'singleton class of a singleton class')
       else
         yield "#{namespace}.#{name}", node, scope_stack.consume! || node
