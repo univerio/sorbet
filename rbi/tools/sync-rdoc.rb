@@ -137,7 +137,7 @@ class DocParser
     error!(scope_stack.last_sig, "unconsumed sig") unless scope_stack.last_sig.nil?
   end
 
-  private def walk_scope(node, &blk)
+  private def walk_scope(node, singleton_class: false, &blk)
     case node.type
     when :MODULE, :CLASS
       path, *, scope = node.children
@@ -151,12 +151,18 @@ class DocParser
       # There are a handful of places in RBIs where we have to use `class <<
       # self` because both a class and it's singleton class need to register a
       # type_member/type_template with the name Elem
-      puts 'skipping :SCLASS node, documentation will not be generated'
+      inst, scope = node.children
+      error!(node, 'class << on something other than self') if inst.type != :SELF
+      if singleton_class
+        error!(node, 'singleton class of a singleton class')
+      else
+        walk_scope(scope, singleton_class: true, &blk)
+      end
     when :SCOPE, :BLOCK, :BEGIN
       assert_clean!
       node.children
         .select {|child| child.is_a?(RubyVM::AbstractSyntaxTree::Node)}
-        .each {|child| walk_scope(child, &blk)}
+        .each {|child| walk_scope(child, singleton_class: singleton_class, &blk)}
     when :CDECL
       names = if node.children.length == 2
         name, _rhs = node.children
@@ -177,13 +183,21 @@ class DocParser
       name, _scope = node.children
       namespace = scope_stack.current_namespace
       namespace = namespace.empty? ? "Object" : namespace
-      yield "#{namespace}\##{name}", node, scope_stack.consume! || node
+      if singleton_class
+        yield "#{namespace}.#{name}", node, scope_stack.consume! || node
+      else
+        yield "#{namespace}\##{name}", node, scope_stack.consume! || node
+      end
     when :DEFS # def self.foo
       receiver, name, scope = node.children
       error!(node, "expected self") unless receiver.type == :SELF
       namespace = scope_stack.current_namespace
       namespace = namespace.empty? ? "Object" : namespace
-      yield "#{namespace}.#{name}", node, scope_stack.consume! || node
+      if singleton_class
+        error!(node, 'singleton class of a singleton class')
+      else
+        yield "#{namespace}.#{name}", node, scope_stack.consume! || node
+      end
 
     when :FCALL # extend Foo
       name, args = node.children
